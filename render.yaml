@@ -2,7 +2,7 @@ services:
   - type: web
     name: stepstone-scraper
     runtime: python
-    buildCommand: "./build.sh"
+    buildCommand: "bash build.sh"
     startCommand: "python scraper.py"
     envVars:
       - key: PYTHON_VERSION
