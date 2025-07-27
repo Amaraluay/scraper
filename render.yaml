@@ -1,5 +1,14 @@
-build:
-  commands:
-    - apt-get update
-    - apt-get install -y wget unzip fonts-liberation libnss3 libatk-bridge2.0-0 libxss1 libasound2 libgtk-3-0 libxshmfence1 libgbm1 libxdamage1 libxrandr2 libatk1.0-0 libdrm2 libxcomposite1 libxext6 libxfixes3 libx11-xcb1 libxcb1
-    - python3 -m playwright install chromium
+services:
+  - type: web
+    name: stepstone-scraper
+    runtime: python
+    region: frankfurt
+    plan: starter
+    buildCommand: |
+      pip install -r requirements.txt
+      python3 -m playwright install chromium
+    startCommand: python3 scraper.py
+    envVars:
+      - key: PYTHONUNBUFFERED
+        value: "true"
+    autoDeploy: false
