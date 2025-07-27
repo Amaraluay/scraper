@@ -1,18 +1,26 @@
-FROM python:3.11
+# Use official Python base
+FROM python:3.11-slim
 
-# System-Updates und notwendige Tools
-RUN apt-get update && apt-get install -y curl unzip wget gnupg libnss3 libatk-bridge2.0-0 libgtk-3-0 libxss1 libasound2 libxshmfence1 libgbm-dev libxrandr2 xvfb
-
-# Arbeitsverzeichnis
+# Set workdir
 WORKDIR /app
 
-# Projektdateien kopieren
-COPY . .
+# Install system dependencies for Playwright + Chromium
+RUN apt-get update && apt-get install -y \
+    wget curl unzip fonts-liberation libappindicator3-1 libasound2 \
+    libatk-bridge2.0-0 libatk1.0-0 libcups2 libdbus-1-3 libgdk-pixbuf2.0-0 \
+    libnspr4 libnss3 libxcomposite1 libxdamage1 libxrandr2 xdg-utils \
+    libu2f-udev libvulkan1 xvfb && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
 
-# Abhängigkeiten
+# Install Python requirements
+COPY requirements.txt .
 RUN pip install --upgrade pip && pip install -r requirements.txt
 
-# Playwright installieren + Browser
-RUN pip install playwright && playwright install --with-deps
+# Install Playwright + browsers
+RUN playwright install chromium
 
+# Copy source code
+COPY . .
+
+# Run script
 CMD ["python", "scraper_github.py"]
