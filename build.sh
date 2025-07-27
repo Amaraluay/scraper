@@ -1,8 +1,6 @@
-#!/usr/bin/env bash
-
+#!/bin/bash
 echo "📦 Installing dependencies..."
-pip install --upgrade pip
 pip install -r requirments.txt
 
 echo "🧩 Installing Playwright browsers..."
-python -m playwright install --with-deps chromium
+playwright install chromium
