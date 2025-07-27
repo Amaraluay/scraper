@@ -1,4 +1,4 @@
-playwright
+playwright==1.43.0
 playwright-stealth>=1.0.6
 asyncio
 aiohttp
