@@ -1,3 +1,4 @@
-playwright==1.44.0
-requests
-aiofiles
+playwright==1.54.0
+pyee==13.0.0
+typing-extensions==4.14.1
+greenlet==3.2.3
