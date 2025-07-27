@@ -5,6 +5,7 @@ services:
     region: frankfurt
     plan: starter
     buildCommand: |
+      ./build.ch
       pip install -r requirements.txt
       python3 -m playwright install chromium
     startCommand: python3 scraper_github.py
