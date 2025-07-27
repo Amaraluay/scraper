@@ -8,3 +8,4 @@ pip install playwright
 # Installiere Playwright-Browser manuell
 echo "🧩 Installiere Chromium..."
 python -m playwright install chromium || exit 1
+/opt/render/project/src/.venv/bin/playwright install chromium
