@@ -1,6 +1,6 @@
 #!/bin/bash
 echo "📦 Installing dependencies..."
-pip install -r requirments.txt
+pip install -r requirements.txt
 
 pip install --upgrade pip
 pip install playwright
