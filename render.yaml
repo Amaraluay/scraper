@@ -7,7 +7,7 @@ services:
     buildCommand: |
       pip install -r requirements.txt
       python3 -m playwright install chromium
-    startCommand: python3 scraper.py
+    startCommand: python3 scraper_github.py
     envVars:
       - key: PYTHONUNBUFFERED
         value: "true"
