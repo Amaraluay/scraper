@@ -3,7 +3,7 @@ services:
     name: stepstone-scraper
     runtime: python
     buildCommand: "bash build.sh"
-    startCommand: "python scraper.py"
+    startCommand: "python scraper_github.py"
     envVars:
       - key: PYTHON_VERSION
         value: 3.10
