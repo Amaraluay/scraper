@@ -32,8 +32,8 @@ SEARCH_PARAMS = [
     ]
     for city, radius in [
         ("regensburg", 50), ("würzburg", 50), ("freiburg", 50), ("ingolstadt", 50),
-        ("trier", 50), ("saarbrücken", 50), ("konstanz", 30), ("nürnberg", 50), ("passau", 50)("ulm", 50)("muenchen", 50)("frankfurt", 50)("augsburg", 50)("stuttgart", 50)
-        ("mannheim", 50)("karlsruhe", 50)("baden baden", 50)("baden", 50)
+        ("trier", 50), ("saarbrücken", 50), ("konstanz", 30), ("nürnberg", 50), ("passau", 50), ("ulm", 50), ("muenchen", 50), ("frankfurt", 50), ("augsburg", 50), ("stuttgart", 50), 
+        ("mannheim", 50), ("karlsruhe", 50), ("baden baden", 50), ("baden", 50)
     ]
 ]
 
