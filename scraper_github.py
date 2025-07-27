@@ -103,9 +103,7 @@ async def scrape():
 
     async with async_playwright() as pw:
      browser = await pw.chromium.launch(headless=True, args=["--no-sandbox"])
-
-
-        context = await browser.new_context(proxy={"server": PROXY_SERVER, "username": PROXY_USER, "password": PROXY_PASS})
+     context = await browser.new_context(proxy={"server": PROXY_SERVER, "username": PROXY_USER, "password": PROXY_PASS})
         page = await context.new_page()
 
         await page.route("**/*", lambda route: route.continue_())
