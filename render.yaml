@@ -2,13 +2,8 @@ services:
   - type: web
     name: stepstone-scraper
     runtime: python
-    region: frankfurt
-    plan: starter
-    buildCommand: |
-      pip install -r requirements.txt
-      python3 -m playwright install chromium
-    startCommand: python3 scraper_github.py
+    buildCommand: "./build.sh"
+    startCommand: "python scraper.py"
     envVars:
-      - key: PYTHONUNBUFFERED
-        value: "true"
-    autoDeploy: false
+      - key: PYTHON_VERSION
+        value: 3.10
