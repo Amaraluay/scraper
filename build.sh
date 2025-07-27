@@ -1,5 +1,4 @@
-#!/bin/bash
-set -e
+#!/usr/bin/env bash
 
-echo "🛠️ Installiere Chromium..."
+echo "📦 Installiere Playwright-Browser..."
 python -m playwright install chromium
