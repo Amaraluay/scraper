@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 
-echo "📦 Installiere Python-Pakete..."
+echo "📦 Installing dependencies..."
 pip install --upgrade pip
-pip install -r Requirments.txt
+pip install -r requirments.txt
 
-echo "🧩 Installiere Playwright-Browser..."
-python -m playwright install chromium
+echo "🧩 Installing Playwright browsers..."
+python -m playwright install --with-deps chromium
