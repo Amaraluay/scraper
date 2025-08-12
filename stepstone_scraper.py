@@ -17,10 +17,11 @@ from playwright_stealth import stealth_async
 OUT_DIR = "/data" if os.path.isdir("/data") else os.getcwd()
 os.makedirs(OUT_DIR, exist_ok=True)
 
-# Proxy/Limit aus Env (optional)
-PROXY_SERVER = os.getenv("PROXY_SERVER", "http://de.decodo.com:20001")
-PROXY_USER   = os.getenv("PROXY_USER",   "sp2ji26uar")
-PROXY_PASS   = os.getenv("PROXY_PASS",   "l1+i6y9qSUFduqv3Sv")
+# Proxy NUR nutzen, wenn gesetzt (keine Defaults!)
+PROXY_SERVER = os.getenv("PROXY_SERVER")
+PROXY_USER   = os.getenv("PROXY_USER")
+PROXY_PASS   = os.getenv("PROXY_PASS")
+
 LEAD_LIMIT   = int(os.getenv("LEAD_LIMIT", "1000"))
 
 # =============================
@@ -34,12 +35,12 @@ ch = logging.StreamHandler(); ch.setFormatter(fmt); logger.addHandler(ch)
 fh = logging.FileHandler(LOG_FILE); fh.setFormatter(fmt); logger.addHandler(fh)
 
 # =============================
-# Config – wie Overnight, aber über mehrere Städte/Keywords
+# Config – exakt wie Overnight
 # =============================
 SEARCH_PARAMS = [
     (kw, city, radius)
     for kw in [
-        "gesundheits-und-krankenpfleger", "pflegehilfskraft", "servicetechniker",
+        "pflegefachkraft", "pflegehilfskraft", "servicetechniker",
         "aussendienst", "produktionsmitarbeiter", "maschinen-und-anlagenfuehrer",
         "fertigungsmitarbeiter", "kundenberater", "kundenservice", "kundendienstberater"
     ]
@@ -53,8 +54,8 @@ SEARCH_PARAMS = [
 ]
 
 PAGE_LIMIT = 20
-MIN_JOBS   = 10   # wie im Overnight-Beispiel
-MAX_JOBS   = 50   # wie im Overnight-Beispiel
+MIN_JOBS   = 10
+MAX_JOBS   = 50
 ACCESS_DENIED_LIMIT = 10
 
 PROGRESS_FILE = os.path.join(OUT_DIR, "progress.txt")
@@ -109,6 +110,35 @@ def append_raw_row(row: Dict):
         writer = csv.DictWriter(f, fieldnames=['keyword','location','title','company','jobs','profile'])
         writer.writerow(row)
 
+# ---- HTTP2/Proxy-robuste Jobzählung auf Profilseite ----
+async def count_jobs_on_profile(browser, context, profile_url: str) -> int:
+    """Versucht zuerst im aktuellen Context. Bei HTTP2-Error: zweiter Versuch ohne Proxy."""
+    async def _count_in_context(ctx):
+        p = await ctx.new_page()
+        try:
+            await stealth_async(p)
+            await p.goto(profile_url, wait_until="domcontentloaded", timeout=30000)
+            await accept_all_cookies(p)
+            return await get_job_count(p)
+        finally:
+            await p.close()
+
+    # 1) erster Versuch (aktueller Context)
+    try:
+        return await _count_in_context(context)
+    except Exception as e:
+        msg = str(e)
+        logger.error(f"❌ Fehler job-count {profile_url}: {e}")
+        # 2) bei HTTP2-Fehler: ohne Proxy neu probieren
+        if "ERR_HTTP2_PROTOCOL_ERROR" in msg or "HTTP2" in msg.upper():
+            logger.info("↪️ HTTP/2-Fehler erkannt – zweiter Versuch ohne Proxy-Context")
+            no_proxy_ctx = await browser.new_context(ignore_https_errors=True)
+            try:
+                return await _count_in_context(no_proxy_ctx)
+            finally:
+                await no_proxy_ctx.close()
+        return 0
+
 # =============================
 # Main scraping (Overnight-Flow)
 # =============================
@@ -130,10 +160,20 @@ async def scrape():
             start_index = 0
 
     async with async_playwright() as pw:
-        browser = await pw.chromium.launch(headless=True, args=["--no-sandbox"])
-        context = await browser.new_context(
-            proxy={"server": PROXY_SERVER, "username": PROXY_USER, "password": PROXY_PASS} if PROXY_SERVER else None
-        )
+        # Browser mit HTTP/2-Workaround starten
+        launch_args = ["--no-sandbox", "--disable-http2"]
+        browser = await pw.chromium.launch(headless=True, args=launch_args)
+
+        # Context: nur Proxy, wenn gesetzt
+        ctx_kwargs = {"ignore_https_errors": True}
+        if PROXY_SERVER:
+            ctx_kwargs["proxy"] = {
+                "server": PROXY_SERVER,
+                **({"username": PROXY_USER} if PROXY_USER else {}),
+                **({"password": PROXY_PASS} if PROXY_PASS else {}),
+            }
+        context = await browser.new_context(**ctx_kwargs)
+
         page = await context.new_page()
         await stealth_async(page)
 
@@ -175,7 +215,7 @@ async def scrape():
                     break
 
                 for i in range(count):
-                    # Limit erneut prüfen
+                    # Limit prüfen
                     if total_hits >= LEAD_LIMIT:
                         logger.info(f"🛑 Lead-Limit erreicht ({LEAD_LIMIT}). Stoppe.")
                         with open(PROGRESS_FILE, 'w') as f: f.write(str(idx))
@@ -184,7 +224,7 @@ async def scrape():
                     try:
                         card = cards.nth(i)
 
-                        # Titel & Firma – exakt wie im Overnight-Beispiel
+                        # Titel & Firma – exakt wie im Overnight-Beispiel (Achtung: Klassen können variieren)
                         title = await card.locator("[data-testid='job-item-title'] div.res-ewgtgq").inner_text()
                         company = await card.locator("span[data-at='job-item-company-name'] span.res-du9bhi").inner_text()
                         title = title.strip(); company = company.strip()
@@ -194,26 +234,16 @@ async def scrape():
                             logger.debug(f"↩️ Überspringe bereits erfasste Firma: {company}")
                             continue
 
-                        # Firmenprofil über Firmenlogo öffnen – exakt wie Overnight
+                        # Firmenprofil über Firmenlogo öffnen – wie Overnight
                         href = await card.locator("a[data-at='company-logo']").get_attribute('href')
                         if not href:
                             logger.warning("⚠️ Kein Unternehmenslink gefunden – überspringen")
                             continue
                         profile_url = href if href.startswith("http") else f"https://www.stepstone.de{href}"
 
-                        prof_page = await context.new_page()
-                        await stealth_async(prof_page)
-
-                        try:
-                            await prof_page.goto(profile_url, wait_until="domcontentloaded", timeout=30000)
-                            await accept_all_cookies(prof_page)
-                            job_count = await get_job_count(prof_page)
-                            logger.info(f"🔎 {company}: {job_count} Jobs")
-                        except Exception as e:
-                            logger.error(f"❌ Fehler job-count {profile_url}: {e}")
-                            await prof_page.close()
-                            continue
-                        await prof_page.close()
+                        # Zählen – robust gegen HTTP/2 + Proxy
+                        job_count = await count_jobs_on_profile(browser, context, profile_url)
+                        logger.info(f"🔎 {company}: {job_count} Jobs")
 
                         if MIN_JOBS <= job_count <= MAX_JOBS:
                             seen_companies.add(company)
