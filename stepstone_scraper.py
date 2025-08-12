@@ -40,7 +40,7 @@ fh = logging.FileHandler(LOG_FILE); fh.setFormatter(fmt); logger.addHandler(fh)
 SEARCH_PARAMS = [
     (kw, city, radius)
     for kw in [
-        "gesundheits-und-krankenpfleger", "pflegehilfskraft", "servicetechniker",
+        "pflegekraft", "pflegehilfskraft", "servicetechniker",
         "aussendienst", "produktionsmitarbeiter", "maschinen-und-anlagenfuehrer",
         "fertigungsmitarbeiter", "kundenberater", "kundenservice", "kundendienstberater"
     ]
