@@ -5,13 +5,15 @@ import logging
 import os
 import re
 import sys
+import time
 from datetime import datetime
 from typing import List, Dict, Set, Optional
+
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 from playwright_stealth import stealth_async
 
 # =============================
-# Output/Env
+# Output/Env (Render-freundlich)
 # =============================
 OUT_DIR = "/data" if os.path.isdir("/data") else os.getcwd()
 os.makedirs(OUT_DIR, exist_ok=True)
@@ -37,7 +39,7 @@ fh = logging.FileHandler(LOG_FILE); fh.setFormatter(fmt); logger.addHandler(fh)
 SEARCH_PARAMS = [
     (kw, city, radius)
     for kw in [
-        "pflegekraft", "pflegehilfskraft", "servicetechniker",
+        "gesundheits-und-krankenpfleger", "pflegehilfskraft", "servicetechniker",
         "aussendienst", "produktionsmitarbeiter", "maschinen-und-anlagenfuehrer",
         "fertigungsmitarbeiter", "kundenberater", "kundenservice", "kundendienstberater"
     ]
@@ -50,7 +52,7 @@ SEARCH_PARAMS = [
     ]
 ]
 PAGE_LIMIT = 20
-MIN_JOBS   = 7
+MIN_JOBS   = 10
 MAX_JOBS   = 50
 ACCESS_DENIED_LIMIT = 10
 
@@ -85,13 +87,53 @@ async def is_access_denied(page) -> bool:
         return False
 
 async def get_job_count(page) -> int:
+    """
+    Robust: probiert mehrere Selektoren und fällt auf JSON im HTML zurück.
+    Liefert 0 nur, wenn wirklich nichts gefunden wird.
+    """
+    selectors = [
+        'span.at-facet-header-total-results',
+        '[data-at="facet-header-total-results"]',
+        '[data-testid="search-total-results"]',
+        '[data-at="total-results"]',
+        'header [data-at="facet-header-total-results"]',
+        'header span[class*="facet-header-total-results"]',
+    ]
+    deadline = time.monotonic() + 8.0
+    while time.monotonic() < deadline:
+        for sel in selectors:
+            try:
+                loc = page.locator(sel)
+                if await loc.count():
+                    text = await loc.first.text_content()
+                    if text:
+                        digits = re.sub(r"\D", "", text)
+                        if digits:
+                            return int(digits)
+            except Exception:
+                pass
+        await asyncio.sleep(0.25)
+
+    # Fallback: JSON im HTML
     try:
-        el = await page.wait_for_selector('span.at-facet-header-total-results', timeout=12000)
-        text = await el.inner_text()
-        digits = re.sub(r"\D", "", text)
-        return int(digits) if digits else 0
+        html = await page.content()
+        patterns = [
+            r'"totalResultCount"\s*:\s*(\d+)',
+            r'"totalResults"\s*:\s*(\d+)',
+            r'"resultCount"\s*:\s*(\d+)',
+            r'"totalJobs"\s*:\s*(\d+)',
+        ]
+        for pat in patterns:
+            m = re.search(pat, html, flags=re.IGNORECASE)
+            if m:
+                return int(m.group(1))
+        # Heuristik: Zahl nahe "Ergebnisse"/"Treffer"
+        m = re.search(r'(Ergebnisse|Treffer)[^0-9]{0,40}(\d[\d\.]*)', html, flags=re.IGNORECASE)
+        if m:
+            return int(re.sub(r'\D', '', m.group(2)))
     except Exception:
-        return 0
+        pass
+    return 0
 
 def ensure_raw_header():
     if not os.path.exists(RAW_CSV):
@@ -105,7 +147,6 @@ def append_raw_row(row: Dict):
         writer.writerow(row)
 
 def extract_company_uid_from_html(html: str) -> Optional[str]:
-    # Mehrere Pattern – UIDs tauchen in Links/JSON auf
     pats = [
         r'companyUid=([0-9a-fA-F\-]{16,})',
         r'"companyUid"\s*:\s*"([0-9a-fA-F\-]{16,})"',
@@ -129,13 +170,21 @@ async def count_on_profile(context, url: str) -> int:
         await p.close()
 
 async def count_on_companyuid(context, uid: str) -> int:
-    """Zählt auf /jobs/?companyUid=... (Fallback)."""
+    """Zählt auf /jobs/?companyUid=... – wartet kurz auf bekannte Zähler und nutzt robuste Zählroutine."""
     list_url = f"https://www.stepstone.de/jobs/?companyUid={uid}"
     p = await context.new_page()
     try:
         await stealth_async(p)
         await p.goto(list_url, wait_until="domcontentloaded", timeout=20000)
         await accept_all_cookies(p)
+        # Optional auf Counter warten (wenn er dynamisch auftaucht)
+        try:
+            await p.wait_for_selector(
+                'span.at-facet-header-total-results, [data-at="facet-header-total-results"], [data-testid="search-total-results"], [data-at="total-results"]',
+                timeout=6000
+            )
+        except Exception:
+            pass
         return await get_job_count(p)
     finally:
         await p.close()
@@ -220,19 +269,26 @@ async def scrape():
                         with open(PROGRESS_FILE, 'w') as f: f.write(str(idx))
                         await browser.close()
                         return
+
                     try:
                         card = cards.nth(i)
 
-                        # === Titel & Firma (wie Overnight; die res-* Klassen sind vom Overnight-Beispiel) ===
-                        title = await card.locator("[data-testid='job-item-title'] div.res-ewgtgq").inner_text()
-                        company = await card.locator("span[data-at='job-item-company-name'] span.res-du9bhi").inner_text()
-                        title = title.strip(); company = company.strip()
-                        logger.info(f"📝 Gefunden: {title} bei {company}")
+                        # === Titel & Firma (wie Overnight) – mit sanftem Fallback ===
+                        title_loc = card.locator("[data-testid='job-item-title'] div.res-ewgtgq")
+                        if await title_loc.count() == 0:
+                            title_loc = card.locator("[data-testid='job-item-title'] div").first
+                        title = (await title_loc.inner_text()).strip()
 
+                        company_loc = card.locator("span[data-at='job-item-company-name'] span.res-du9bhi")
+                        if await company_loc.count() == 0:
+                            company_loc = card.locator("span[data-at='job-item-company-name'] span").first
+                        company = (await company_loc.inner_text()).strip()
+
+                        logger.info(f"📝 Gefunden: {title} bei {company}")
                         if company in seen_companies:
                             continue
 
-                        # 1) Primärweg wie Overnight: Logo-Link → Firmenprofil zählen
+                        # Primär: Firmenprofil (Logo-Link) → zählen
                         profile_url = None
                         logo = card.locator("a[data-at='company-logo']").first
                         if await logo.count():
@@ -247,18 +303,19 @@ async def scrape():
                             except Exception as e:
                                 logger.debug(f"Profilzählung fehlgeschlagen: {e}")
 
-                        # 2) Fallback: companyUid holen (direkt aus Karte oder aus Jobdetailseite)
+                        # Fallback: companyUid (aus Karte oder Detailseite) → /jobs/?companyUid=...
+                        current_uid: Optional[str] = None
                         if job_count == 0:
-                            uid = None
                             # a) direkt aus Karte (Namenslink mit companyUid)
                             name_link = card.locator("[data-at='job-item-company-name'] a[href*='companyUid=']").first
                             if await name_link.count():
                                 href = await name_link.get_attribute("href") or ""
                                 m = re.search(r'companyUid=([0-9a-fA-F\-]{16,})', href)
-                                if m: uid = m.group(1)
+                                if m:
+                                    current_uid = m.group(1)
 
                             # b) sonst Jobdetailseite kurz öffnen und UID parsen
-                            if not uid:
+                            if not current_uid:
                                 job_a = card.locator("[data-testid='job-item-title'] a").first
                                 if await job_a.count():
                                     href = await job_a.get_attribute("href")
@@ -269,16 +326,16 @@ async def scrape():
                                             await d.goto(job_url, wait_until="domcontentloaded", timeout=20000)
                                             await accept_all_cookies(d)
                                             html = await d.content()
-                                            uid = extract_company_uid_from_html(html)
+                                            current_uid = extract_company_uid_from_html(html)
                                         except Exception:
                                             pass
                                         finally:
                                             await d.close()
 
-                            if uid:
-                                job_count = await count_on_companyuid(context, uid)
+                            if current_uid:
+                                job_count = await count_on_companyuid(context, current_uid)
                                 if job_count > 0:
-                                    logger.info(f"🔗 Fallback via companyUid erfolgreich ({uid})")
+                                    logger.info(f"🔗 Fallback via companyUid ok ({current_uid})")
 
                         logger.info(f"🔎 {company}: {job_count} Jobs")
 
@@ -290,7 +347,7 @@ async def scrape():
                                 'title': title,
                                 'company': company,
                                 'jobs': job_count,
-                                'profile': profile_url or (f"https://www.stepstone.de/jobs/?companyUid={uid}" if job_count>0 and 'uid' in locals() and uid else "")
+                                'profile': profile_url or (f"https://www.stepstone.de/jobs/?companyUid={current_uid}" if current_uid else "")
                             }
                             raw_leads.append(entry)
                             append_raw_row(entry)
