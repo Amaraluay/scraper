@@ -17,11 +17,9 @@ from playwright_stealth import stealth_async
 OUT_DIR = "/data" if os.path.isdir("/data") else os.getcwd()
 os.makedirs(OUT_DIR, exist_ok=True)
 
-# Proxy NUR nutzen, wenn gesetzt
 PROXY_SERVER = os.getenv("PROXY_SERVER")
 PROXY_USER   = os.getenv("PROXY_USER")
 PROXY_PASS   = os.getenv("PROXY_PASS")
-
 LEAD_LIMIT   = int(os.getenv("LEAD_LIMIT", "1000"))
 
 # =============================
@@ -35,12 +33,12 @@ ch = logging.StreamHandler(); ch.setFormatter(fmt); logger.addHandler(ch)
 fh = logging.FileHandler(LOG_FILE); fh.setFormatter(fmt); logger.addHandler(fh)
 
 # =============================
-# Config – wie Overnight
+# Config (wie Overnight)
 # =============================
 SEARCH_PARAMS = [
     (kw, city, radius)
     for kw in [
-        "pflegekraft", "pflegehilfskraft", "servicetechniker",
+        "gesundheits-und-krankenpfleger", "pflegehilfskraft", "servicetechniker",
         "aussendienst", "produktionsmitarbeiter", "maschinen-und-anlagenfuehrer",
         "fertigungsmitarbeiter", "kundenberater", "kundenservice", "kundendienstberater"
     ]
@@ -64,7 +62,13 @@ RAW_CSV   = os.path.join(OUT_DIR, f"stepstone_raw_leads_{ts}.csv")
 FINAL_CSV = os.path.join(OUT_DIR, f"stepstone_leads_{ts}.csv")
 
 # =============================
-# Helpers (Overnight + smarte Fallbacks)
+# Caches
+# =============================
+COMPANY_UID_CACHE: Dict[str, str]   = {}  # company -> UID
+COMPANY_COUNT_CACHE: Dict[str, int] = {}  # company -> jobs
+
+# =============================
+# Helpers
 # =============================
 def slug_city(text: str) -> str:
     repl = (("ä","ae"),("ö","oe"),("ü","ue"),("ß","ss"))
@@ -72,26 +76,13 @@ def slug_city(text: str) -> str:
     for a,b in repl: s = s.replace(a,b)
     return re.sub(r"\s+", "-", s)
 
-def slug_company_for_cmp(name: str) -> str:
-    """Slug für /cmp/de/<slug>--<id>/jobs"""
-    repl = (("ä","ae"),("ö","oe"),("ü","ue"),("ß","ss"))
-    s = name.strip().lower()
-    for a,b in repl: s = s.replace(a,b)
-    s = re.sub(r"[^a-z0-9\s\-/&\.]", "", s)
-    s = s.replace("&", "und").replace("/", "-").replace(".", "")
-    s = re.sub(r"[\s\-]+", "-", s).strip("-")
-    return s
-
 def build_search_url(keyword: str, city: str, radius: int, page_num: int) -> str:
     return f"https://www.stepstone.de/jobs/{keyword}/in-{slug_city(city)}?radius={radius}&page={page_num}&searchOrigin=Resultlist_top-search"
 
 async def accept_all_cookies(page):
     try:
-        await page.click('#ccmgt_explicit_accept', timeout=5000)
-        logger.debug("✅ Cookies akzeptiert")
-    except PlaywrightTimeoutError:
-        logger.debug("⚠️ Kein Cookie-Banner oder bereits akzeptiert")
-    except Exception:
+        await page.click('#ccmgt_explicit_accept', timeout=4000)
+    except:
         pass
 
 async def is_access_denied(page) -> bool:
@@ -106,7 +97,7 @@ async def get_job_count(page) -> int:
         el = await page.wait_for_selector('span.at-facet-header-total-results', timeout=8000)
         text = await el.inner_text()
         return int(re.sub(r"\D", "", text))
-    except Exception:
+    except:
         return 0
 
 def ensure_raw_header():
@@ -132,61 +123,84 @@ def extract_company_uid_from_html(html: str) -> Optional[str]:
             return m.group(1)
     return None
 
-def extract_company_id_from_html(html: str) -> Optional[str]:
-    patterns = [
-        r'/cmp/de/[^"\']*--(\d+)/jobs',
-        r'"companyId"\s*:\s*"?(\d+)"?',
-        r'"employerId"\s*:\s*"?(\d+)"?',
-        r"data-company-id=['\"](\d+)['\"]",
-    ]
-    for pat in patterns:
-        m = re.search(pat, html, flags=re.IGNORECASE)
-        if m:
-            return m.group(1)
-    return None
-
-async def count_on_url(browser, context, url: str, is_cmp: bool=False) -> int:
+async def count_on_listing(browser, context, listing_url: str) -> int:
     """
-    Zählt auf einer URL. Kurze Timeouts, niemals Exception nach außen.
-    Bei Proxy/HTTP2-Fehlern: Retry ohne Proxy.
-    cmp-Seiten bekommen noch kürzere Timeouts (weil oft zickig).
+    Zählt auf /jobs/?companyUid=... – die einzige Seite, die wir aktiv nutzen.
+    Kurze Timeouts, Ressourcen-Blocking beschleunigt das Laden.
     """
-    nav_timeout = 6000 if is_cmp else 12000
-
-    async def _count_in_ctx(ctx):
+    async def _count(ctx):
         p = await ctx.new_page()
         try:
             await stealth_async(p)
-            await p.goto(url, wait_until="commit", timeout=nav_timeout)
+            await p.goto(listing_url, wait_until="domcontentloaded", timeout=12000)
             await accept_all_cookies(p)
             return await get_job_count(p)
         except Exception as e:
-            logger.debug(f"count_in_ctx fail {url}: {e}")
+            logger.debug(f"count_on_listing fail {listing_url}: {e}")
             return 0
         finally:
             await p.close()
 
-    # 1) im aktuellen Context
-    c = await _count_in_ctx(context)
+    # 1) aktueller Context
+    c = await _count(context)
     if c > 0:
         return c
 
     # 2) Retry ohne Proxy (nur wenn Proxy gesetzt war)
     if PROXY_SERVER:
         try:
-            logger.info("↪️ Retry ohne Proxy-Context")
+            logger.info("↪️ Retry Listing ohne Proxy-Context")
             no_proxy_ctx = await browser.new_context(ignore_https_errors=True)
             try:
-                return await _count_in_ctx(no_proxy_ctx)
+                return await _count(no_proxy_ctx)
             finally:
                 await no_proxy_ctx.close()
         except Exception as e:
-            logger.debug(f"no-proxy retry fail {url}: {e}")
+            logger.debug(f"no-proxy retry fail {listing_url}: {e}")
 
     return 0
 
+async def make_browser(pw):
+    # Browser
+    browser = await pw.chromium.launch(
+        headless=True,
+        args=["--no-sandbox", "--disable-http2"]
+    )
+
+    # Context
+    ctx_kwargs = {
+        "ignore_https_errors": True,
+        "user_agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                       "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36)"),
+        "locale": "de-DE",
+    }
+    if PROXY_SERVER:
+        ctx_kwargs["proxy"] = {
+            "server": PROXY_SERVER,
+            **({"username": PROXY_USER} if PROXY_USER else {}),
+            **({"password": PROXY_PASS} if PROXY_PASS else {}),
+        }
+
+    context = await browser.new_context(**ctx_kwargs)
+
+    # Ressourcen-Blocking
+    async def route_handler(route, request):
+        if request.resource_type in ("image", "media", "font", "stylesheet"):
+            return await route.abort()
+        url = request.url
+        if any(bad in url for bad in ("googletagmanager", "google-analytics", "doubleclick", "facebook", "hotjar", "segment.io")):
+            return await route.abort()
+        return await route.continue_()
+    await context.route("**/*", route_handler)
+
+    page = await context.new_page()
+    await stealth_async(page)
+    context.set_default_timeout(10000)
+    context.set_default_navigation_timeout(15000)
+    return browser, context, page
+
 # =============================
-# Main scraping (Overnight-Flow + smarte Reihenfolge)
+# Main scraping
 # =============================
 async def scrape():
     raw_leads: List[Dict] = []
@@ -196,7 +210,6 @@ async def scrape():
 
     ensure_raw_header()
 
-    # Progress lesen
     start_index = 0
     if os.path.exists(PROGRESS_FILE):
         try:
@@ -206,28 +219,12 @@ async def scrape():
             start_index = 0
 
     async with async_playwright() as pw:
-        # Browser mit HTTP/2-Workaround starten
-        launch_args = ["--no-sandbox", "--disable-http2"]
-        browser = await pw.chromium.launch(headless=True, args=launch_args)
-
-        # Context: nur Proxy, wenn gesetzt
-        ctx_kwargs = {"ignore_https_errors": True}
-        if PROXY_SERVER:
-            ctx_kwargs["proxy"] = {
-                "server": PROXY_SERVER,
-                **({"username": PROXY_USER} if PROXY_USER else {}),
-                **({"password": PROXY_PASS} if PROXY_PASS else {}),
-            }
-        context = await browser.new_context(**ctx_kwargs)
-
-        page = await context.new_page()
-        await stealth_async(page)
+        browser, context, page = await make_browser(pw)
 
         for idx, (keyword, location, radius) in enumerate(SEARCH_PARAMS[start_index:], start=start_index):
             logger.info(f"🚀 Starte Suche {idx+1}/{len(SEARCH_PARAMS)}: {keyword} in {location}")
 
             for page_index in range(1, PAGE_LIMIT + 1):
-                # Lead-Limit prüfen
                 if total_hits >= LEAD_LIMIT:
                     logger.info(f"🛑 Lead-Limit erreicht ({LEAD_LIMIT}). Stoppe.")
                     with open(PROGRESS_FILE, 'w') as f: f.write(str(idx))
@@ -270,98 +267,82 @@ async def scrape():
                     try:
                         card = cards.nth(i)
 
-                        # Titel & Firma – exakt wie im Overnight-Beispiel
+                        # Titel & Firma – wie Overnight (Achtung: Klassen können variieren)
                         title = await card.locator("[data-testid='job-item-title'] div.res-ewgtgq").inner_text()
                         company = await card.locator("span[data-at='job-item-company-name'] span.res-du9bhi").inner_text()
                         title = title.strip(); company = company.strip()
                         logger.info(f"📝 Gefunden: {title} bei {company}")
 
-                        if company in seen_companies:
-                            logger.debug(f"↩️ Überspringe bereits erfasste Firma: {company}")
-                            continue
+                        # Cache: sofort bedienen
+                        if company in COMPANY_COUNT_CACHE:
+                            cached = COMPANY_COUNT_CACHE[company]
+                            logger.info(f"🔁 Cache-Treffer {company}: {cached} Jobs")
+                            job_count = cached
+                        else:
+                            # 1) UID evtl. direkt im Namenslink
+                            uid = COMPANY_UID_CACHE.get(company)
+                            if not uid:
+                                uid_link = card.locator("[data-at='job-item-company-name'] a[href*='companyUid=']").first
+                                if await uid_link.count():
+                                    href = await uid_link.get_attribute("href")
+                                    m = re.search(r'companyUid=([0-9a-fA-F\-]{16,})', href or "")
+                                    if m:
+                                        uid = m.group(1)
+                                        COMPANY_UID_CACHE[company] = uid
 
-                        # Bevorzugt: Namenslink mit companyUid= direkt aus der Karte
-                        listing_url = None
-                        name_uid_link = card.locator("[data-at='job-item-company-name'] a[href*='companyUid=']").first
-                        if await name_uid_link.count():
-                            href = await name_uid_link.get_attribute("href")
-                            if href:
-                                listing_url = href if href.startswith("http") else f"https://www.stepstone.de{href}"
-                                logger.debug(f"[PATH] listing_url aus Karte: {listing_url}")
+                            # 2) wenn noch keine UID → kurze Detailseite öffnen & UID parsen
+                            if not uid:
+                                job_a = card.locator("[data-testid='job-item-title'] a").first
+                                job_href = await job_a.get_attribute("href") if await job_a.count() else None
+                                if job_href:
+                                    job_url = job_href if job_href.startswith("http") else f"https://www.stepstone.de{job_href}"
+                                    d = await context.new_page(); await stealth_async(d)
+                                    try:
+                                        await d.goto(job_url, wait_until="commit", timeout=10000)
+                                        await accept_all_cookies(d)
+                                        html = await d.content()
+                                        uid = extract_company_uid_from_html(html)
+                                        if uid:
+                                            COMPANY_UID_CACHE[company] = uid
+                                    except Exception:
+                                        pass
+                                    finally:
+                                        await d.close()
 
-                        # Logo-Link (Profil) wie Overnight
-                        profile_url = None
-                        logo_link = card.locator("a[data-at='company-logo']").first
-                        if await logo_link.count():
-                            href = await logo_link.get_attribute('href')
-                            if href:
-                                profile_url = href if href.startswith("http") else f"https://www.stepstone.de{href}"
+                            # 3) Zählen nur über UID-Listing (CMP wird NICHT benutzt)
+                            job_count = 0
+                            if uid:
+                                listing_url = f"https://www.stepstone.de/jobs/?companyUid={uid}"
+                                job_count = await count_on_listing(browser, context, listing_url)
+                            else:
+                                logger.debug(f"⚠️ Keine companyUid für {company} gefunden.")
 
-                        # Jobdetail-URL (für UID/ID-Fallback)
-                        job_detail_url = None
-                        job_link = card.locator("[data-testid='job-item-title'] a").first
-                        if await job_link.count():
-                            job_href = await job_link.get_attribute("href")
-                            if job_href:
-                                job_detail_url = job_href if job_href.startswith("http") else f"https://www.stepstone.de{job_href}"
-
-                        # ===== Zähl-Reihenfolge =====
-                        job_count = 0
-
-                        # 1) Direkt companyUid-Listing aus Karte
-                        if listing_url:
-                            job_count = await count_on_url(browser, context, listing_url, is_cmp=False)
-
-                        # 2) Wenn nichts: kurzer Versuch auf Profil (cmp kann hängen)
-                        if job_count == 0 and profile_url:
-                            is_cmp = "/cmp/" in profile_url
-                            job_count = await count_on_url(browser, context, profile_url, is_cmp=is_cmp)
-
-                        # 3) Wenn immer noch 0: UID/ID aus Detailseite holen
-                        if job_count == 0 and job_detail_url:
-                            d = await context.new_page(); await stealth_async(d)
-                            try:
-                                await d.goto(job_detail_url, wait_until="commit", timeout=12000)
-                                await accept_all_cookies(d)
-                                html = await d.content()
-                                uid = extract_company_uid_from_html(html)
-                                if uid:
-                                    list_url = f"https://www.stepstone.de/jobs/?companyUid={uid}"
-                                    logger.debug(f"[PATH] listing_url aus Detail-UID: {list_url}")
-                                    job_count = await count_on_url(browser, context, list_url, is_cmp=False)
-                                if job_count == 0:
-                                    comp_id = extract_company_id_from_html(html)
-                                    if comp_id:
-                                        cmp_url = f"https://www.stepstone.de/cmp/de/{slug_company_for_cmp(company)}--{comp_id}/jobs"
-                                        logger.debug(f"[PATH] cmp_url aus Detail-ID: {cmp_url}")
-                                        job_count = await count_on_url(browser, context, cmp_url, is_cmp=True)
-                            except Exception as e:
-                                logger.debug(f"Detailseite fail {job_detail_url}: {e}")
-                            finally:
-                                await d.close()
+                            # Positives Ergebnis cache’n
+                            if job_count > 0:
+                                COMPANY_COUNT_CACHE[company] = job_count
 
                         logger.info(f"🔎 {company}: {job_count} Jobs")
 
                         if MIN_JOBS <= job_count <= MAX_JOBS:
-                            seen_companies.add(company)
-                            entry = {
-                                'keyword': keyword,
-                                'location': location,
-                                'title': title,
-                                'company': company,
-                                'jobs': job_count,
-                                'profile': listing_url or profile_url or ""
-                            }
-                            raw_leads.append(entry)
-                            append_raw_row(entry)
-                            total_hits += 1
-                            logger.info(f"🚀 Lead {total_hits} gespeichert: {company} ({job_count})")
+                            if company not in seen_companies:
+                                seen_companies.add(company)
+                                entry = {
+                                    'keyword': keyword,
+                                    'location': location,
+                                    'title': title,
+                                    'company': company,
+                                    'jobs': job_count,
+                                    'profile': f"https://www.stepstone.de/jobs/?companyUid={COMPANY_UID_CACHE.get(company,'')}" if company in COMPANY_UID_CACHE else ""
+                                }
+                                raw_leads.append(entry)
+                                append_raw_row(entry)
+                                total_hits += 1
+                                logger.info(f"🚀 Lead {total_hits} gespeichert: {company} ({job_count})")
 
                     except Exception as e:
                         logger.error(f"❌ Fehler beim Auslesen Karte {i+1}: {e}")
                         continue
 
-            # Fortschritt sichern (nächste Stadt/Keyword)
             with open(PROGRESS_FILE, 'w') as f:
                 f.write(str(idx+1))
 
