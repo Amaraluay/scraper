@@ -35,12 +35,12 @@ ch = logging.StreamHandler(); ch.setFormatter(fmt); logger.addHandler(ch)
 fh = logging.FileHandler(LOG_FILE); fh.setFormatter(fmt); logger.addHandler(fh)
 
 # =============================
-# Config – exakt wie Overnight
+# Config – wie Overnight
 # =============================
 SEARCH_PARAMS = [
     (kw, city, radius)
     for kw in [
-        "pflegefachkraft", "pflegehilfskraft", "servicetechniker",
+        "pflegekraft", "pflegehilfskraft", "servicetechniker",
         "aussendienst", "produktionsmitarbeiter", "maschinen-und-anlagenfuehrer",
         "fertigungsmitarbeiter", "kundenberater", "kundenservice", "kundendienstberater"
     ]
@@ -64,13 +64,25 @@ RAW_CSV   = os.path.join(OUT_DIR, f"stepstone_raw_leads_{ts}.csv")
 FINAL_CSV = os.path.join(OUT_DIR, f"stepstone_leads_{ts}.csv")
 
 # =============================
-# Helpers (wie Overnight)
+# Helpers (wie Overnight + Fallback)
 # =============================
-def slug_city(city: str) -> str:
+def slug_city(text: str) -> str:
     repl = (("ä","ae"),("ö","oe"),("ü","ue"),("ß","ss"))
-    c = city.strip().lower()
-    for a,b in repl: c = c.replace(a,b)
-    return c.replace(" ", "-")
+    s = text.strip().lower()
+    for a,b in repl: s = s.replace(a,b)
+    return re.sub(r"\s+", "-", s)
+
+def slug_company_for_cmp(name: str) -> str:
+    """Slug für /cmp/de/<slug>--<id>/jobs"""
+    repl = (("ä","ae"),("ö","oe"),("ü","ue"),("ß","ss"))
+    s = name.strip().lower()
+    for a,b in repl: s = s.replace(a,b)
+    # nur buchstaben/zahlen/leerzeichen/- behalten
+    s = re.sub(r"[^a-z0-9\s\-&/\.]", "", s)
+    s = s.replace("&", "und").replace("/", "-")
+    s = s.replace(".", "")
+    s = re.sub(r"[\s\-]+", "-", s).strip("-")
+    return s
 
 def build_search_url(keyword: str, city: str, radius: int, page_num: int) -> str:
     return f"https://www.stepstone.de/jobs/{keyword}/in-{slug_city(city)}?radius={radius}&page={page_num}&searchOrigin=Resultlist_top-search"
@@ -110,6 +122,20 @@ def append_raw_row(row: Dict):
         writer = csv.DictWriter(f, fieldnames=['keyword','location','title','company','jobs','profile'])
         writer.writerow(row)
 
+def extract_company_id_from_html(html: str) -> str | None:
+    """Finde eine companyId / employerId oder eine cmp-URL mit --<id> im Detailseiten-HTML."""
+    patterns = [
+        r'/cmp/de/[^"\']*--(\d+)/jobs',
+        r'"companyId"\s*:\s*"?(\d+)"?',
+        r'"employerId"\s*:\s*"?(\d+)"?',
+        r"data-company-id=['\"](\d+)['\"]",
+    ]
+    for pat in patterns:
+        m = re.search(pat, html, flags=re.IGNORECASE)
+        if m:
+            return m.group(1)
+    return None
+
 # ---- HTTP2/Proxy-robuste Jobzählung auf Profilseite ----
 async def count_jobs_on_profile(browser, context, profile_url: str) -> int:
     """Versucht zuerst im aktuellen Context. Bei HTTP2-Error: zweiter Versuch ohne Proxy."""
@@ -140,7 +166,7 @@ async def count_jobs_on_profile(browser, context, profile_url: str) -> int:
         return 0
 
 # =============================
-# Main scraping (Overnight-Flow)
+# Main scraping (Overnight-Flow + Fallback auf /cmp/de/<slug>--<id>/jobs)
 # =============================
 async def scrape():
     raw_leads: List[Dict] = []
@@ -224,7 +250,7 @@ async def scrape():
                     try:
                         card = cards.nth(i)
 
-                        # Titel & Firma – exakt wie im Overnight-Beispiel (Achtung: Klassen können variieren)
+                        # Titel & Firma – exakt wie im Overnight-Beispiel
                         title = await card.locator("[data-testid='job-item-title'] div.res-ewgtgq").inner_text()
                         company = await card.locator("span[data-at='job-item-company-name'] span.res-du9bhi").inner_text()
                         title = title.strip(); company = company.strip()
@@ -234,12 +260,34 @@ async def scrape():
                             logger.debug(f"↩️ Überspringe bereits erfasste Firma: {company}")
                             continue
 
-                        # Firmenprofil über Firmenlogo öffnen – wie Overnight
+                        # 1) Firmenprofil über Firmenlogo öffnen – wie Overnight
                         href = await card.locator("a[data-at='company-logo']").get_attribute('href')
-                        if not href:
-                            logger.warning("⚠️ Kein Unternehmenslink gefunden – überspringen")
+                        profile_url = href if href and href.startswith("http") else (f"https://www.stepstone.de{href}" if href else None)
+
+                        # 2) Fallback: wenn kein Unternehmenslink existiert → Detailseite öffnen, companyId extrahieren, cmp-URL bauen
+                        if not profile_url:
+                            job_link = card.locator("[data-testid='job-item-title'] a").first
+                            job_href = await job_link.get_attribute("href") if await job_link.count() else None
+                            if job_href:
+                                job_url = job_href if job_href.startswith("http") else f"https://www.stepstone.de{job_href}"
+                                d = await context.new_page(); await stealth_async(d)
+                                try:
+                                    await d.goto(job_url, wait_until="domcontentloaded", timeout=30000)
+                                    await accept_all_cookies(d)
+                                    html = await d.content()
+                                    comp_id = extract_company_id_from_html(html)
+                                    if comp_id:
+                                        slug = slug_company_for_cmp(company)
+                                        profile_url = f"https://www.stepstone.de/cmp/de/{slug}--{comp_id}/jobs"
+                                        logger.info(f"🔗 Fallback-Company-URL konstruiert: {profile_url}")
+                                except Exception as e:
+                                    logger.debug(f"⚠️ Detail-Fallback fehlgeschlagen: {e}")
+                                finally:
+                                    await d.close()
+
+                        if not profile_url:
+                            logger.warning("⚠️ Kein Unternehmenslink & kein Fallback ermittelbar – überspringen")
                             continue
-                        profile_url = href if href.startswith("http") else f"https://www.stepstone.de{href}"
 
                         # Zählen – robust gegen HTTP/2 + Proxy
                         job_count = await count_jobs_on_profile(browser, context, profile_url)
