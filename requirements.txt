@@ -1,2 +1,2 @@
-playwright==1.46.0
-playwright-stealth==1.0.6
+scrapy>=2.11
+scrapy-playwright>=0.0.33
